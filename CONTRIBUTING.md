@@ -53,3 +53,9 @@ CI tests four native platform/architecture combinations, builds downloadable art
 Before merging, require CI and review any change to command execution, credentials, SSH quoting, process lifecycle, state persistence or install/uninstall. The repository owner must configure branch protection in GitHub; workflow YAML cannot enforce it. Use conventional commits with a description of the reason and relevant validation.
 
 Do not commit local `docs/`, `AGENTS.md`, `.dogfood/`, state, logs or credentials. Public user and contributor documentation lives in the tracked root Markdown files.
+
+## Git with an intentional fake-IP proxy
+
+Git SSH authentication is independent of the GitHub CLI/API login. A working repository SSH key does not give `gh` the same account's API access.
+
+If the native resolver stalls but the proxy's current GitHub fake-IP mapping works, use a **repository-local** `core.sshCommand` override with `HostName=<current-fake-IP>`, `HostKeyAlias=github.com`, `IdentitiesOnly=yes`, and your designated key. Retain host-key checking. This avoids changing system DNS, routes or the proxy. Do not commit machine-specific key paths or mappings into shared scripts. Fake-IP assignments can change when the proxy resets; refresh the mapping when necessary. Once normal resolution works, remove the HostName override while preserving any existing repository-specific key selection.
