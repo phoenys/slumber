@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 repository = "https://github.com/phoenys/slumber"
+publish = false
 license = "MIT"
 description = "Local-first task handoff and resumption for coding agents"
 

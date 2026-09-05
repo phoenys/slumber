@@ -88,7 +88,11 @@ pub fn now_secs() -> u64 {
 
 pub fn state_dir() -> Result<PathBuf> {
     if let Some(path) = env::var_os("SLUMBER_HOME") {
-        return Ok(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            bail!("SLUMBER_HOME must be absolute");
+        }
+        return Ok(path);
     }
     let home = env::var_os("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".slumber"))
@@ -96,7 +100,11 @@ pub fn state_dir() -> Result<PathBuf> {
 
 pub fn socket_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("SLUMBER_SOCKET") {
-        return Ok(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            bail!("SLUMBER_SOCKET must be absolute");
+        }
+        return Ok(path);
     }
     if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
         return Ok(PathBuf::from(path).join("slumber/slumber.sock"));

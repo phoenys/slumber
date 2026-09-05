@@ -430,6 +430,7 @@ case "$1" in
   kill-pane)
     printf 'kill %s\n' "$*" >> "$TMUX_TEST_DIR/events"
     : > "$TMUX_TEST_DIR/killed"
+    exit 1 # Simulate an already-closed pane: wake-up must still happen.
     ;;
   *) exit 2 ;;
 esac
