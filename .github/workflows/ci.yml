@@ -89,7 +89,7 @@ jobs:
           persist-credentials: false
       - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: cargo audit
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: false
