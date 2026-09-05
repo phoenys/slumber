@@ -1,18 +1,18 @@
 use crate::{
     core::{
-        AgentKind, DAEMON_PROTOCOL_VERSION, JobSubmitRequest, JobSubmitResponse,
+        AgentKind, DAEMON_PROTOCOL_VERSION, DaemonRequest, JobSubmitRequest, JobSubmitResponse,
         create_private_dir, exit_status_text, job_dir, recent_jobs, socket_path, state_dir,
     },
     daemon,
 };
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 use std::{
     collections::HashMap,
     env,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{IsTerminal, Write},
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
@@ -22,7 +22,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
-    time::sleep,
+    time::{sleep, timeout},
 };
 
 const PROTOCOL_MARKER: &str = "<!-- SLUMBER PROTOCOL -->";
@@ -58,6 +58,9 @@ enum Commands {
         /// Do not open a tmux pane that follows task logs.
         #[arg(long)]
         no_tail: bool,
+        /// Delegate without waking an agent (for standalone shell use).
+        #[arg(long, conflicts_with_all = ["session_id", "resume_template"])]
+        no_resume: bool,
     },
     /// Show running and recently completed jobs.
     Status {
@@ -72,15 +75,33 @@ enum Commands {
     },
     /// Add the Slumber handoff protocol to an agent instructions file.
     Init {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "agent")]
         file: Option<PathBuf>,
+        #[arg(long, value_enum)]
+        agent: Option<InitAgent>,
     },
-    /// Run the local daemon.
-    #[command(hide = true)]
+    /// Check local prerequisites without submitting a job.
+    Doctor,
+    /// Retry a completed job's failed wake-up command.
+    Retry { job_id: String },
+    /// Run in the foreground, or explicitly manage the background daemon.
     Daemon {
-        #[arg(long)]
-        detached: bool,
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
     },
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum InitAgent {
+    Codex,
+    Claude,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonAction {
+    Start,
+    Status,
+    Stop,
 }
 
 impl Cli {
@@ -92,11 +113,37 @@ impl Cli {
                 resume_template,
                 ssh,
                 no_tail,
-            } => run(command, session_id, resume_template, ssh, no_tail).await,
+                no_resume,
+            } => {
+                run(
+                    command,
+                    session_id,
+                    resume_template,
+                    ssh,
+                    no_tail,
+                    no_resume,
+                )
+                .await
+            }
             Commands::Status { limit } => status(limit),
             Commands::Logs { job_id, err } => logs(&job_id, err),
-            Commands::Init { file } => init(file.as_deref()),
-            Commands::Daemon { detached } => daemon::serve(detached).await,
+            Commands::Init { file, agent } => init(file.as_deref(), agent),
+            Commands::Doctor => doctor().await,
+            Commands::Retry { job_id } => {
+                job_dir(&job_id)?;
+                ensure_daemon().await?;
+                println!(
+                    "{}",
+                    exchange(&DaemonRequest::Retry { job_id }).await?["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                );
+                Ok(())
+            }
+            Commands::Daemon { action: None } => daemon::serve().await,
+            Commands::Daemon {
+                action: Some(action),
+            } => manage_daemon(action).await,
         }
     }
 }
@@ -107,11 +154,20 @@ async fn run(
     resume_template: Option<String>,
     ssh_target: Option<String>,
     no_tail: bool,
+    no_resume: bool,
 ) -> Result<()> {
     if command.trim().is_empty() {
         bail!("command must not be empty");
     }
 
+    let session_id = session_id
+        .or_else(detected_session_id)
+        .filter(|id| !id.trim().is_empty());
+    if !no_resume && resume_template.is_none() && session_id.is_none() {
+        bail!(
+            "no agent session detected; use --session-id, --resume-template, or --no-resume for standalone use"
+        );
+    }
     let tmux_tail = tmux_tail_enabled(no_tail)?;
     ensure_daemon().await?;
     let protocol_path = state_dir()?.join("slumberd.protocol");
@@ -121,10 +177,13 @@ async fn run(
         bail!("running daemon uses an incompatible protocol; restart it and retry");
     }
     let cwd = env::current_dir()?.canonicalize()?;
-    let session_id = session_id.or_else(detected_session_id);
-    let agent_kind = match resume_template {
-        Some(resume_template) => AgentKind::GenericCommand { resume_template },
-        None => AgentKind::CodeX,
+    let agent_kind = if no_resume {
+        AgentKind::NoResume
+    } else {
+        match resume_template {
+            Some(resume_template) => AgentKind::GenericCommand { resume_template },
+            None => AgentKind::CodeX,
+        }
     };
     let request = JobSubmitRequest {
         command,
@@ -135,7 +194,8 @@ async fn run(
         ssh_target,
         tmux_pane_id: tmux_tail.then(String::new),
     };
-    let response = submit(&request).await?;
+    let response: JobSubmitResponse =
+        serde_json::from_value(exchange(&DaemonRequest::Submit(request)).await?)?;
 
     println!("Submitted {} (process {})", response.job_id, response.pgid);
     println!("stdout: {}", response.stdout_path.display());
@@ -179,7 +239,7 @@ fn detected_session_id() -> Option<String> {
         .or_else(|| env::var("CODEX_SESSION_ID").ok())
 }
 
-async fn submit(request: &JobSubmitRequest) -> Result<JobSubmitResponse> {
+async fn exchange(request: &DaemonRequest) -> Result<Value> {
     let socket = socket_path()?;
     let mut stream = UnixStream::connect(&socket)
         .await
@@ -187,6 +247,9 @@ async fn submit(request: &JobSubmitRequest) -> Result<JobSubmitResponse> {
     validate_daemon_identity(&socket, &stream)?;
     let mut line = serde_json::to_vec(request)?;
     line.push(b'\n');
+    if line.len() > 1024 * 1024 {
+        bail!("request exceeds 1 MiB");
+    }
     stream.write_all(&line).await?;
 
     let mut response = String::new();
@@ -198,7 +261,7 @@ async fn submit(request: &JobSubmitRequest) -> Result<JobSubmitResponse> {
     if let Some(message) = value.get("error").and_then(Value::as_str) {
         bail!("daemon rejected job: {message}");
     }
-    serde_json::from_value(value).context("parse job submission response")
+    Ok(value)
 }
 
 fn validate_daemon_identity(socket: &Path, stream: &UnixStream) -> Result<()> {
@@ -225,12 +288,14 @@ fn validate_daemon_identity(socket: &Path, stream: &UnixStream) -> Result<()> {
 
 async fn ensure_daemon() -> Result<()> {
     let socket = socket_path()?;
-    if UnixStream::connect(&socket).await.is_ok() {
+    if let Ok(stream) = UnixStream::connect(&socket).await {
+        validate_daemon_identity(&socket, &stream)?;
         return Ok(());
     }
 
     let state = state_dir()?;
     create_private_dir(&state)?;
+    create_private_dir(socket.parent().context("socket path has no parent")?)?;
     let log_path = state.join("slumberd.log");
     let stdout = OpenOptions::new()
         .create(true)
@@ -241,7 +306,8 @@ async fn ensure_daemon() -> Result<()> {
     let executable = env::current_exe()?;
     let mut child = Command::new(executable);
     child
-        .args(["daemon", "--detached"])
+        .arg("daemon")
+        .current_dir(&state)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -256,7 +322,7 @@ async fn ensure_daemon() -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut delay = Duration::from_millis(25);
     while Instant::now() < deadline {
-        if UnixStream::connect(&socket).await.is_ok() {
+        if exchange(&DaemonRequest::Ping).await.is_ok() {
             return Ok(());
         }
         sleep(delay).await;
@@ -266,6 +332,89 @@ async fn ensure_daemon() -> Result<()> {
         "daemon did not start within 2 seconds; inspect {}",
         log_path.display()
     )
+}
+
+async fn manage_daemon(action: DaemonAction) -> Result<()> {
+    if matches!(action, DaemonAction::Start) {
+        ensure_daemon().await?;
+        let response = exchange(&DaemonRequest::Ping).await?;
+        println!(
+            "Daemon running (protocol {}, active {}).",
+            response["protocol"], response["active"]
+        );
+        return Ok(());
+    }
+    match UnixStream::connect(socket_path()?).await {
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            println!("Daemon is not running.");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let response = exchange(&match action {
+        DaemonAction::Stop => DaemonRequest::Stop,
+        _ => DaemonRequest::Ping,
+    })
+    .await?;
+    if matches!(action, DaemonAction::Stop) {
+        for _ in 0..100 {
+            if !socket_path()?.exists() {
+                println!("Daemon stopped.");
+                return Ok(());
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        bail!("daemon acknowledged stop but has not exited yet");
+    }
+    println!(
+        "Daemon running (protocol {}, active {}).",
+        response["protocol"], response["active"]
+    );
+    Ok(())
+}
+
+async fn doctor() -> Result<()> {
+    println!(
+        "Slumber {} — {} / {}",
+        env!("CARGO_PKG_VERSION"),
+        env::consts::OS,
+        env::consts::ARCH
+    );
+    println!("State: {}", state_dir()?.display());
+    println!("Socket: {}", socket_path()?.display());
+    for (program, args) in [
+        ("sh", vec!["-c", "exit 0"]),
+        ("ssh", vec!["-V"]),
+        ("tmux", vec!["-V"]),
+        ("codex", vec!["queue", "--help"]),
+    ] {
+        let mut command = tokio::process::Command::new(program);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let available = matches!(timeout(Duration::from_secs(5), command.status()).await, Ok(Ok(status)) if status.success());
+        println!(
+            "{program}: {}",
+            if available {
+                "available"
+            } else {
+                "missing or incompatible"
+            }
+        );
+    }
+    println!(
+        "Codex requires a build with `codex queue` plus a valid logged-in session. SSH and tmux are optional."
+    );
+    manage_daemon(DaemonAction::Status).await
 }
 
 fn status(limit: usize) -> Result<()> {
@@ -284,7 +433,13 @@ fn status(limit: usize) -> Result<()> {
             .exit_status
             .as_ref()
             .map(exit_status_text)
-            .unwrap_or_else(|| "running".to_owned());
+            .unwrap_or_else(|| {
+                if meta.resume_error.is_some() {
+                    "unknown".to_owned()
+                } else {
+                    "running".to_owned()
+                }
+            });
         let pgid = meta
             .pgid
             .map(|value| value.to_string())
@@ -294,6 +449,11 @@ fn status(limit: usize) -> Result<()> {
             "{:<30} {:<10} {:<18} {:<10} {}",
             meta.job_id, pgid, target, status, meta.command
         );
+        if let Some(error) = meta.resume_error {
+            println!("  wake-up: FAILED: {error}");
+        } else if meta.resumed_at.is_some() {
+            println!("  wake-up: complete");
+        }
     }
     Ok(())
 }
@@ -319,19 +479,32 @@ fn logs(job_id: &str, err: bool) -> Result<()> {
         return Ok(());
     }
     let path = job_dir(job_id)?.join(name);
-    let content = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    std::io::stdout().write_all(&content)?;
+    let mut file = fs::File::open(&path).with_context(|| format!("read {}", path.display()))?;
+    std::io::copy(&mut file, &mut std::io::stdout())?;
     Ok(())
 }
 
-fn init(file: Option<&Path>) -> Result<()> {
-    let path = file.map(Path::to_path_buf).unwrap_or_else(|| {
-        if Path::new("AGENTS.md").exists() {
-            PathBuf::from("AGENTS.md")
-        } else {
-            PathBuf::from("CLAUDE.md")
+fn init(file: Option<&Path>, agent: Option<InitAgent>) -> Result<()> {
+    let path = match (file, agent) {
+        (Some(path), _) => path.to_owned(),
+        (_, Some(InitAgent::Codex)) => PathBuf::from("AGENTS.md"),
+        (_, Some(InitAgent::Claude)) => PathBuf::from("CLAUDE.md"),
+        _ => {
+            if !std::io::stdin().is_terminal() {
+                bail!("choose --agent codex, --agent claude, or --file <path>");
+            }
+            print!("Agent (codex/claude), or instructions file path: ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            match input.trim() {
+                "codex" => PathBuf::from("AGENTS.md"),
+                "claude" => PathBuf::from("CLAUDE.md"),
+                "" => bail!("no agent or path selected"),
+                path => PathBuf::from(path),
+            }
         }
-    });
+    };
     let existing = fs::read_to_string(&path).unwrap_or_default();
     if existing.contains(PROTOCOL_MARKER) {
         println!("Slumber protocol already present in {}", path.display());

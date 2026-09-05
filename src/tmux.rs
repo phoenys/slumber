@@ -13,6 +13,34 @@ pub async fn open_log_pane(
         return Ok(None);
     }
     let tmux_env = request.env_vars.get("TMUX").context("TMUX is not set")?;
+    let source_pane = request
+        .env_vars
+        .get("TMUX_PANE")
+        .context("TMUX_PANE is not set")?;
+    let dimensions = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            source_pane,
+            "#{pane_width} #{pane_height}",
+        ])
+        .env_clear()
+        .envs(&request.env_vars)
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+    let dimensions = String::from_utf8(dimensions.stdout)?;
+    let mut dimensions = dimensions
+        .split_whitespace()
+        .filter_map(|s| s.parse::<u32>().ok());
+    let width = dimensions
+        .next()
+        .context("could not read tmux pane width")?;
+    let height = dimensions
+        .next()
+        .context("could not read tmux pane height")?;
+    let direction = if width >= height { "-h" } else { "-v" };
     let tail_command = match request.ssh_target.as_deref() {
         Some(target) => {
             let remote_tail = format!(
@@ -33,16 +61,22 @@ pub async fn open_log_pane(
 
     let mut command = Command::new("tmux");
     command
-        .args(["split-window", "-h", "-d", "-P", "-F", "#{pane_id}"])
+        .args([
+            "split-window",
+            direction,
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            source_pane,
+        ])
         .env_clear()
         .envs(&request.env_vars)
         .env("TMUX", tmux_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(source_pane) = request.env_vars.get("TMUX_PANE") {
-        command.args(["-t", source_pane]);
-    }
     let output = command.arg(tail_command).output().await?;
     if !output.status.success() {
         bail!(

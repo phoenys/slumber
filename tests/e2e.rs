@@ -16,11 +16,15 @@ fn temp_root(name: &str) -> PathBuf {
 }
 
 fn isolated(command: &mut Command, root: &Path) {
+    fs::create_dir_all(root).unwrap();
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
     command
         .env("SLUMBER_HOME", root.join("state"))
         .env("SLUMBER_SOCKET", root.join("slumber.sock"))
         .env_remove("CODEX_THREAD_ID")
-        .env_remove("CODEX_SESSION_ID");
+        .env_remove("CODEX_SESSION_ID")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE");
 }
 
 #[test]
@@ -127,8 +131,116 @@ fn init_is_idempotent() {
     }
 
     let content = fs::read_to_string(&instructions).unwrap();
+    let no_choice = Command::new(binary)
+        .current_dir(&root)
+        .arg("init")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!no_choice.status.success());
+    assert!(!root.join("CLAUDE.md").exists());
     fs::remove_dir_all(&root).unwrap();
     assert_eq!(content.matches("<!-- SLUMBER PROTOCOL -->").count(), 1);
+}
+
+#[test]
+fn failed_wakeup_is_visible_retryable_and_blocks_stop_while_active() {
+    let binary = env!("CARGO_BIN_EXE_slumber");
+    let root = temp_root("retry");
+    let mut run = Command::new(binary);
+    isolated(&mut run, &root);
+    let output = run.env("REQUEST_SECRET", "snapshot-secret")
+        .args(["run", "--resume-template", "test -f \"$SLUMBER_HOME/allow-resume\" || { echo retry-needed >&2; exit 12; }; printf '%s' \"$REQUEST_SECRET\" > \"$SLUMBER_HOME/retried\"", "sleep 0.3"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let submission = String::from_utf8(output.stdout).unwrap();
+    let id = submission.split_whitespace().nth(1).unwrap();
+    let dir = root.join("state/jobs").join(id);
+    let mut stop = Command::new(binary);
+    isolated(&mut stop, &root);
+    assert!(
+        !stop
+            .args(["daemon", "stop"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    for _ in 0..100 {
+        if fs::read_to_string(dir.join("meta.json"))
+            .unwrap()
+            .contains("wake-up command failed")
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let meta = fs::read_to_string(dir.join("meta.json")).unwrap();
+    assert!(meta.contains("wake-up command failed"));
+    assert!(meta.contains("\"resumed_at\": null"));
+    assert!(
+        fs::read_to_string(dir.join("resume.log"))
+            .unwrap()
+            .contains("retry-needed")
+    );
+    fs::write(root.join("state/allow-resume"), "").unwrap();
+    let mut retry = Command::new(binary);
+    isolated(&mut retry, &root);
+    assert!(retry.args(["retry", id]).output().unwrap().status.success());
+    for _ in 0..100 {
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("request.json")).unwrap()).unwrap();
+        if value["env_vars"].as_object().unwrap().is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("state/retried")).unwrap(),
+        "snapshot-secret"
+    );
+    assert!(
+        !fs::read_to_string(dir.join("request.json"))
+            .unwrap()
+            .contains("snapshot-secret")
+    );
+    let mut stop = Command::new(binary);
+    isolated(&mut stop, &root);
+    assert!(
+        stop.args(["daemon", "stop"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn refuses_shared_socket_directory_without_changing_permissions() {
+    let binary = env!("CARGO_BIN_EXE_slumber");
+    let root = temp_root("permissions");
+    let mut command = Command::new(binary);
+    isolated(&mut command, &root);
+    let shared = root.join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+    let output = command
+        .env("SLUMBER_SOCKET", shared.join("socket"))
+        .args(["run", "--no-resume", "true"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("0700"));
+    assert_eq!(
+        fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+    assert!(!shared.join("socket").exists());
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -167,6 +279,7 @@ esac
         &fake_tmux,
         r#"#!/bin/sh
 case "$1" in
+  display-message) printf '20 40\n' ;;
   split-window)
     printf '%s\n' "$*" > "$TMUX_TEST_DIR/split"
     printf '%%9\n'
@@ -286,6 +399,7 @@ esac
     assert!(payload.contains("Remote Target    : gpu-box"));
     assert!(payload.contains("gpu-box:~/.slumber/jobs/"));
     assert!(tmux_split.contains("ssh -t"));
+    assert!(tmux_split.contains("split-window -v"));
     assert!(tmux_split.contains("gpu-box"));
     assert!(tmux_split.contains("stdout.log"));
     assert!(tmux_split.contains("stderr.log"));
@@ -308,6 +422,7 @@ fn tmux_log_pane_opens_and_closes_before_resume() {
         &fake_tmux,
         r#"#!/bin/sh
 case "$1" in
+  display-message) printf '80 24\n' ;;
   split-window)
     printf 'split %s\n' "$*" >> "$TMUX_TEST_DIR/events"
     printf '%%7\n'
