@@ -43,6 +43,8 @@ pub async fn resume(
             Command::new("codex")
                 .args(["queue", "--thread", session_id, "--message", &payload])
                 .current_dir(&request.cwd)
+                .env_clear()
+                .envs(&request.env_vars)
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(resume_log))
                 .stderr(Stdio::from(resume_err))
@@ -53,6 +55,8 @@ pub async fn resume(
             Command::new("sh")
                 .args(["-c", resume_template])
                 .current_dir(&request.cwd)
+                .env_clear()
+                .envs(&request.env_vars)
                 .env(
                     "SLUMBER_SESSION_ID",
                     request.session_id.as_deref().unwrap_or(""),

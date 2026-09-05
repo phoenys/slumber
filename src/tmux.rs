@@ -34,6 +34,8 @@ pub async fn open_log_pane(
     let mut command = Command::new("tmux");
     command
         .args(["split-window", "-h", "-d", "-P", "-F", "#{pane_id}"])
+        .env_clear()
+        .envs(&request.env_vars)
         .env("TMUX", tmux_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -63,6 +65,8 @@ pub async fn close_log_pane(request: &JobSubmitRequest) {
     let mut command = Command::new("tmux");
     command
         .args(["kill-pane", "-t", pane_id])
+        .env_clear()
+        .envs(&request.env_vars)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

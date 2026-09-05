@@ -13,7 +13,7 @@ use std::{
     env,
     fs::{self, OpenOptions},
     io::Write,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -114,15 +114,11 @@ async fn run(
 
     let tmux_tail = tmux_tail_enabled(no_tail)?;
     ensure_daemon().await?;
-    if ssh_target.is_some() || tmux_tail {
-        let protocol_path = state_dir()?.join("slumberd.protocol");
-        let protocol = fs::read_to_string(&protocol_path).unwrap_or_default();
-        let daemon_pid = fs::read_to_string(state_dir()?.join("slumberd.pid")).unwrap_or_default();
-        if protocol.trim() != format!("{DAEMON_PROTOCOL_VERSION}:{}", daemon_pid.trim()) {
-            bail!(
-                "running daemon does not support the requested job features; restart it and retry"
-            );
-        }
+    let protocol_path = state_dir()?.join("slumberd.protocol");
+    let protocol = fs::read_to_string(&protocol_path).unwrap_or_default();
+    let daemon_pid = fs::read_to_string(state_dir()?.join("slumberd.pid")).unwrap_or_default();
+    if protocol.trim() != format!("{DAEMON_PROTOCOL_VERSION}:{}", daemon_pid.trim()) {
+        bail!("running daemon uses an incompatible protocol; restart it and retry");
     }
     let cwd = env::current_dir()?.canonicalize()?;
     let session_id = session_id.or_else(detected_session_id);
@@ -188,6 +184,7 @@ async fn submit(request: &JobSubmitRequest) -> Result<JobSubmitResponse> {
     let mut stream = UnixStream::connect(&socket)
         .await
         .with_context(|| format!("connect to daemon at {}", socket.display()))?;
+    validate_daemon_identity(&socket, &stream)?;
     let mut line = serde_json::to_vec(request)?;
     line.push(b'\n');
     stream.write_all(&line).await?;
@@ -202,6 +199,28 @@ async fn submit(request: &JobSubmitRequest) -> Result<JobSubmitResponse> {
         bail!("daemon rejected job: {message}");
     }
     serde_json::from_value(value).context("parse job submission response")
+}
+
+fn validate_daemon_identity(socket: &Path, stream: &UnixStream) -> Result<()> {
+    let metadata = fs::metadata(socket)
+        .with_context(|| format!("inspect daemon socket at {}", socket.display()))?;
+    if !metadata.file_type().is_socket() {
+        bail!("daemon path is not a Unix socket: {}", socket.display());
+    }
+
+    let expected_uid = nix::unistd::geteuid().as_raw();
+    let peer_uid = stream
+        .peer_cred()
+        .context("inspect daemon peer credentials")?
+        .uid();
+    if metadata.uid() != expected_uid || peer_uid != expected_uid {
+        bail!(
+            "refusing untrusted daemon at {}: expected UID {expected_uid}, socket UID {}, peer UID {peer_uid}",
+            socket.display(),
+            metadata.uid()
+        );
+    }
+    Ok(())
 }
 
 async fn ensure_daemon() -> Result<()> {

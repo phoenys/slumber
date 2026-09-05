@@ -187,7 +187,6 @@ esac
         command
             .env("PATH", &fake_path)
             .env("FAKE_SSH_HOME", &fake_remote)
-            .env("REMOTE_TEST_SECRET", "must-not-be-persisted")
             .env("TMUX", "/tmp/fake-remote-tmux,456,0")
             .env("TMUX_PANE", "%2")
             .env("TMUX_TEST_DIR", &tmux_state);
@@ -195,13 +194,15 @@ esac
 
     let mut run = Command::new(binary);
     configure(&mut run);
+    run.env("REMOTE_TEST_SECRET", "request-secret")
+        .env_remove("DAEMON_ONLY_SECRET");
     let output = run
         .args([
             "run",
             "--ssh",
             "gpu-box",
             "--resume-template",
-            "test -f \"$TMUX_TEST_DIR/killed\" && printf resumed > \"$SLUMBER_HOME/resumed\"",
+            "test -f \"$TMUX_TEST_DIR/killed\" && printf '%s|%s' \"$REMOTE_TEST_SECRET\" \"${DAEMON_ONLY_SECRET-unset}\" > \"$SLUMBER_HOME/resumed\"",
             "printf remote-command",
         ])
         .output()
@@ -214,6 +215,13 @@ esac
     let submission = String::from_utf8(output.stdout).unwrap();
     let job_id = submission.split_whitespace().nth(1).unwrap().to_owned();
     let local_job = root.join("state/jobs").join(&job_id);
+    let persisted_request = fs::read_to_string(local_job.join("request.json")).unwrap();
+    let request_mode = fs::metadata(local_job.join("request.json"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let job_dir_mode = fs::metadata(&local_job).unwrap().permissions().mode() & 0o777;
     let first_daemon: i32 = fs::read_to_string(root.join("state/slumberd.pid"))
         .unwrap()
         .parse()
@@ -228,6 +236,9 @@ esac
     fs::write(fake_remote.join("exit_code"), "23\n").unwrap();
     let mut daemon_command = Command::new(binary);
     configure(&mut daemon_command);
+    daemon_command
+        .env_remove("REMOTE_TEST_SECRET")
+        .env("DAEMON_ONLY_SECRET", "daemon-secret");
     let mut daemon = daemon_command
         .arg("daemon")
         .stdin(Stdio::null())
@@ -237,7 +248,13 @@ esac
         .unwrap();
 
     for _ in 0..100 {
-        if root.join("state/resumed").exists() && local_job.join("payload.md").exists() {
+        let request_is_cleared = fs::read_to_string(local_job.join("request.json"))
+            .map(|request| !request.contains("request-secret"))
+            .unwrap_or(false);
+        if root.join("state/resumed").exists()
+            && local_job.join("payload.md").exists()
+            && request_is_cleared
+        {
             break;
         }
         thread::sleep(Duration::from_millis(20));
@@ -249,6 +266,7 @@ esac
     let wrapper = fs::read_to_string(fake_remote.join("wrapper.sh")).unwrap();
     let tmux_split = fs::read_to_string(tmux_state.join("split")).unwrap();
     let tmux_kill = fs::read_to_string(tmux_state.join("killed")).unwrap();
+    let resumed = fs::read_to_string(root.join("state/resumed")).unwrap();
     let mut logs = Command::new(binary);
     configure(&mut logs);
     let logs = logs.args(["logs", &job_id]).output().unwrap();
@@ -259,7 +277,12 @@ esac
 
     assert!(meta.contains("\"Exited\": 23"));
     assert!(meta.contains("\"ssh_target\": \"gpu-box\""));
-    assert!(!request.contains("must-not-be-persisted"));
+    assert!(persisted_request.contains("request-secret"));
+    assert_eq!(request_mode, 0o600);
+    assert_eq!(job_dir_mode, 0o700);
+    assert!(!request.contains("request-secret"));
+    assert!(request.contains("\"env_vars\": {}"));
+    assert_eq!(resumed, "request-secret|unset");
     assert!(payload.contains("Remote Target    : gpu-box"));
     assert!(payload.contains("gpu-box:~/.slumber/jobs/"));
     assert!(tmux_split.contains("ssh -t"));

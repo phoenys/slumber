@@ -11,6 +11,7 @@ use nix::{
     unistd::{Pid, setpgid},
 };
 use std::{
+    collections::HashMap,
     fs::OpenOptions,
     future::Future,
     os::unix::{fs::OpenOptionsExt, process::ExitStatusExt},
@@ -155,16 +156,17 @@ async fn start_remote(mut request: JobSubmitRequest) -> Result<(JobSubmitRespons
         tmux_pane_id: None,
     };
     write_meta(&meta)?;
-    write_request(&job_id, &persistable_request(&request))?;
+    write_request(&job_id, &request)?;
 
     let script = remote_wrapper(&job_id, &request.command);
-    let remote_pid = match launch_remote(&target, &script).await {
+    let remote_pid = match launch_remote(&target, &script, &request.env_vars).await {
         Ok(pid) => pid,
         Err(error) => {
             meta.finished_at = Some(now_secs());
             meta.exit_status = Some(ExitStatusRecord::FailedToStart(format!("{error:#}")));
             meta.resumed_at = Some(now_secs());
             write_meta(&meta)?;
+            clear_persisted_environment(&job_id, &request)?;
             return Err(error);
         }
     };
@@ -172,7 +174,7 @@ async fn start_remote(mut request: JobSubmitRequest) -> Result<(JobSubmitRespons
     meta.pgid = Some(remote_pid);
     attach_log_pane(&mut request, &mut meta, &stdout_path, &stderr_path).await;
     write_meta(&meta)?;
-    write_request(&job_id, &persistable_request(&request))?;
+    write_request(&job_id, &request)?;
 
     let response = JobSubmitResponse {
         job_id: job_id.clone(),
@@ -205,12 +207,10 @@ async fn attach_log_pane(
     }
 }
 
-fn persistable_request(request: &JobSubmitRequest) -> JobSubmitRequest {
-    let mut persisted = request.clone();
-    persisted
-        .env_vars
-        .retain(|key, _| key == "TMUX" || key == "TMUX_PANE");
-    persisted
+fn clear_persisted_environment(job_id: &str, request: &JobSubmitRequest) -> Result<()> {
+    let mut cleared = request.clone();
+    cleared.env_vars.clear();
+    write_request(job_id, &cleared)
 }
 
 pub fn recover_remote_jobs() -> Result<Vec<Completion>> {
@@ -241,8 +241,12 @@ pub fn recover_remote_jobs() -> Result<Vec<Completion>> {
     Ok(completions)
 }
 
-async fn launch_remote(target: &str, script: &str) -> Result<u32> {
-    let mut child = ssh_command(target)
+async fn launch_remote(
+    target: &str,
+    script: &str,
+    env_vars: &HashMap<String, String>,
+) -> Result<u32> {
+    let mut child = ssh_command(target, env_vars)
         .args(["sh", "-s"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -288,7 +292,11 @@ async fn monitor_remote(
         meta.job_id
     );
     loop {
-        match ssh_command(target).arg(&exit_command).output().await {
+        match ssh_command(target, &request.env_vars)
+            .arg(&exit_command)
+            .output()
+            .await
+        {
             Ok(output) if output.status.success() => {
                 let code: i32 = String::from_utf8_lossy(&output.stdout)
                     .trim()
@@ -311,13 +319,16 @@ async fn resume_remote(
     stderr_path: PathBuf,
 ) -> Result<()> {
     resumer::resume(&request, &meta, &stdout_path, &stderr_path).await?;
+    clear_persisted_environment(&meta.job_id, &request)?;
     meta.resumed_at = Some(now_secs());
     write_meta(&meta)
 }
 
-fn ssh_command(target: &str) -> Command {
+fn ssh_command(target: &str, env_vars: &HashMap<String, String>) -> Command {
     let mut command = Command::new("ssh");
     command
+        .env_clear()
+        .envs(env_vars)
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
         .arg(target);
     command

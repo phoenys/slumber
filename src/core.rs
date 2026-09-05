@@ -9,7 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const DAEMON_PROTOCOL_VERSION: &str = "3";
+pub const DAEMON_PROTOCOL_VERSION: &str = "4";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSubmitRequest {
