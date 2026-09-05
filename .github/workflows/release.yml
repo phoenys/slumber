@@ -1,0 +1,38 @@
+name: Prepare draft release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag (for example v0.1.0)'
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ inputs.tag }}
+  draft:
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: slumber-*
+          path: dist
+          merge-multiple: true
+      - name: Verify tag matches crate version and create draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$TAG" = "v$version"
+          gh release create "$TAG" dist/slumber-* --verify-tag --draft --title "Slumber $TAG" --notes-file CHANGELOG.md

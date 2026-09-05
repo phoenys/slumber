@@ -1,0 +1,133 @@
+name: CI
+on:
+  push:
+    branches: [main, 'release/**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ''
+  schedule:
+    - cron: '23 8 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - run: cargo +stable fmt --check
+      - run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - run: cargo +stable test --locked
+      - run: cargo +stable build --locked --release
+      - name: Clean user installation smoke test
+        run: sh scripts/smoke.sh "$PWD/target/release/slumber"
+      - name: Install tmux and shellcheck (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux shellcheck
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: command -v tmux || brew install tmux
+      - name: Real tmux smoke test
+        run: sh scripts/tmux-smoke.sh "$PWD/target/release/slumber"
+      - name: Shell lint
+        if: runner.os == 'Linux'
+        run: shellcheck install.sh uninstall.sh scripts/*.sh
+      - name: Prepare binary artifact
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist
+          cp target/release/slumber "dist/slumber-$TARGET"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slumber-${{ matrix.target }}
+          path: dist/slumber-*
+          if-no-files-found: error
+
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - run: rustup toolchain install 1.89.0 --profile minimal
+      - run: cargo +1.89.0 check --locked --all-targets
+
+  security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo audit
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
+      - name: Secret scan (history, redacted output)
+        run: |
+          go install github.com/zricethezav/gitleaks/v8@v8.30.0
+          "$(go env GOPATH)/bin/gitleaks" git --redact --no-banner .
+      - name: Workflow lint
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" -shellcheck=
+
+  ssh:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - run: cargo build --release --locked
+      - name: Disposable local SSH server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo useradd -m -s /bin/sh slumber-ci
+          sudo passwd -d slumber-ci
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          ssh-keygen -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+          sudo install -d -m 700 -o slumber-ci -g slumber-ci /home/slumber-ci/.ssh
+          sudo install -m 600 -o slumber-ci -g slumber-ci "$HOME/.ssh/id_ed25519.pub" /home/slumber-ci/.ssh/authorized_keys
+          sudo systemctl start ssh
+          ssh-keyscan -H 127.0.0.1 >> "$HOME/.ssh/known_hosts"
+          ssh -o BatchMode=yes slumber-ci@127.0.0.1 true
+      - name: Real SSH handoff smoke test
+        run: sh scripts/ssh-smoke.sh "$PWD/target/release/slumber" slumber-ci@127.0.0.1
+      - name: Reject foreign UID before transmitting secrets
+        run: |
+          sudo install -m 755 target/release/slumber /usr/local/bin/slumber-ipc-test
+          sudo python3 scripts/ipc-security.py /usr/local/bin/slumber-ipc-test slumber-ci

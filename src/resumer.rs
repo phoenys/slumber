@@ -1,14 +1,12 @@
 use crate::{
-    core::{AgentKind, JobMeta, JobSubmitRequest, exit_status_text, job_dir, now_secs},
+    core::{
+        AgentKind, JobMeta, JobSubmitRequest, exit_status_text, job_dir, now_secs,
+        write_private_atomic,
+    },
     tmux,
 };
-use anyhow::{Context, Result};
-use std::{
-    fs::{self, OpenOptions},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::Path,
-    process::Stdio,
-};
+use anyhow::{Context, Result, bail};
+use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, process::Stdio};
 use tokio::process::Command;
 
 pub async fn resume(
@@ -22,49 +20,58 @@ pub async fn resume(
         return Ok(());
     };
     let started_at = meta.started_at.unwrap_or(meta.created_at);
-    let duration = meta.finished_at.unwrap_or_else(now_secs) - started_at;
+    let duration = meta
+        .finished_at
+        .unwrap_or_else(now_secs)
+        .saturating_sub(started_at);
     let payload = build_payload(request, status, duration, stdout_path, stderr_path);
     let directory = job_dir(&meta.job_id)?;
     let payload_path = directory.join("payload.md");
-    fs::write(&payload_path, &payload)?;
-    fs::set_permissions(&payload_path, fs::Permissions::from_mode(0o600))?;
-
-    match &request.agent_kind {
+    write_private_atomic(&payload_path, payload.as_bytes())?;
+    let mut command = match &request.agent_kind {
+        AgentKind::NoResume => return Ok(()),
         AgentKind::CodeX => {
-            let Some(session_id) = request.session_id.as_deref() else {
-                return Ok(());
-            };
-            let resume_log = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(directory.join("resume.log"))?;
-            let resume_err = resume_log.try_clone()?;
-            Command::new("codex")
-                .args(["queue", "--thread", session_id, "--message", &payload])
-                .current_dir(&request.cwd)
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(resume_log))
-                .stderr(Stdio::from(resume_err))
-                .spawn()
-                .context("start Codex resumer")?;
+            let session_id = request
+                .session_id
+                .as_deref()
+                .context("missing Codex session ID")?;
+            let mut command = Command::new("codex");
+            command.args(["queue", "--thread", session_id, "--message", &payload]);
+            command
         }
         AgentKind::GenericCommand { resume_template } => {
-            Command::new("sh")
-                .args(["-c", resume_template])
-                .current_dir(&request.cwd)
-                .env(
-                    "SLUMBER_SESSION_ID",
-                    request.session_id.as_deref().unwrap_or(""),
-                )
-                .env("SLUMBER_PAYLOAD", &payload)
-                .env("SLUMBER_PAYLOAD_PATH", &payload_path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("start generic resumer")?;
+            let mut command = Command::new("sh");
+            command.args(["-c", resume_template]);
+            command
         }
+    };
+    let resume_log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(directory.join("resume.log"))?;
+    let resume_err = resume_log.try_clone()?;
+    let status = command
+        .current_dir(&request.cwd)
+        .env_clear()
+        .envs(&request.env_vars)
+        .env(
+            "SLUMBER_SESSION_ID",
+            request.session_id.as_deref().unwrap_or(""),
+        )
+        .env("SLUMBER_PAYLOAD", &payload)
+        .env("SLUMBER_PAYLOAD_PATH", &payload_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(resume_log))
+        .stderr(Stdio::from(resume_err))
+        .status()
+        .await
+        .context("run wake-up command")?;
+    if !status.success() {
+        bail!(
+            "wake-up command failed ({status}); inspect {}/resume.log",
+            directory.display()
+        );
     }
     Ok(())
 }

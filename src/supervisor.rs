@@ -1,7 +1,8 @@
 use crate::{
     core::{
         ExitStatusRecord, JobMeta, JobSubmitRequest, JobSubmitResponse, create_private_dir,
-        job_dir, now_secs, read_request, recent_jobs, signal_name, write_meta, write_request,
+        job_dir, now_secs, read_meta, read_request, recent_jobs, signal_name, write_meta,
+        write_request,
     },
     resumer, tmux,
 };
@@ -11,6 +12,7 @@ use nix::{
     unistd::{Pid, setpgid},
 };
 use std::{
+    collections::HashMap,
     fs::OpenOptions,
     future::Future,
     os::unix::{fs::OpenOptionsExt, process::ExitStatusExt},
@@ -73,6 +75,7 @@ async fn start_local(mut request: JobSubmitRequest) -> Result<(JobSubmitResponse
         ssh_target: None,
         resumed_at: None,
         tmux_pane_id: None,
+        resume_error: None,
     };
     write_meta(&meta)?;
 
@@ -107,6 +110,7 @@ async fn start_local(mut request: JobSubmitRequest) -> Result<(JobSubmitResponse
     meta.pgid = Some(pgid);
     attach_log_pane(&mut request, &mut meta, &stdout_path, &stderr_path).await;
     write_meta(&meta)?;
+    write_request(&job_id, &request)?;
 
     let response = JobSubmitResponse {
         job_id: job_id.clone(),
@@ -124,9 +128,7 @@ async fn start_local(mut request: JobSubmitRequest) -> Result<(JobSubmitResponse
         meta.finished_at = Some(now_secs());
         meta.exit_status = Some(record);
         write_meta(&meta)?;
-        resumer::resume(&request, &meta, &stdout_path, &stderr_path).await?;
-        meta.resumed_at = Some(now_secs());
-        write_meta(&meta)
+        finish_resume(request, meta, stdout_path, stderr_path).await
     });
     Ok((response, completion))
 }
@@ -153,18 +155,20 @@ async fn start_remote(mut request: JobSubmitRequest) -> Result<(JobSubmitRespons
         ssh_target: Some(target.clone()),
         resumed_at: None,
         tmux_pane_id: None,
+        resume_error: None,
     };
     write_meta(&meta)?;
-    write_request(&job_id, &persistable_request(&request))?;
+    write_request(&job_id, &request)?;
 
     let script = remote_wrapper(&job_id, &request.command);
-    let remote_pid = match launch_remote(&target, &script).await {
+    let remote_pid = match launch_remote(&target, &script, &request.env_vars).await {
         Ok(pid) => pid,
         Err(error) => {
             meta.finished_at = Some(now_secs());
             meta.exit_status = Some(ExitStatusRecord::FailedToStart(format!("{error:#}")));
             meta.resumed_at = Some(now_secs());
             write_meta(&meta)?;
+            clear_persisted_environment(&job_id, &request)?;
             return Err(error);
         }
     };
@@ -172,7 +176,7 @@ async fn start_remote(mut request: JobSubmitRequest) -> Result<(JobSubmitRespons
     meta.pgid = Some(remote_pid);
     attach_log_pane(&mut request, &mut meta, &stdout_path, &stderr_path).await;
     write_meta(&meta)?;
-    write_request(&job_id, &persistable_request(&request))?;
+    write_request(&job_id, &request)?;
 
     let response = JobSubmitResponse {
         job_id: job_id.clone(),
@@ -205,18 +209,32 @@ async fn attach_log_pane(
     }
 }
 
-fn persistable_request(request: &JobSubmitRequest) -> JobSubmitRequest {
-    let mut persisted = request.clone();
-    persisted
-        .env_vars
-        .retain(|key, _| key == "TMUX" || key == "TMUX_PANE");
-    persisted
+fn clear_persisted_environment(job_id: &str, request: &JobSubmitRequest) -> Result<()> {
+    let mut cleared = request.clone();
+    cleared.env_vars.clear();
+    write_request(job_id, &cleared)
 }
 
-pub fn recover_remote_jobs() -> Result<Vec<Completion>> {
+pub fn recover_jobs() -> Result<Vec<Completion>> {
     let mut completions = Vec::new();
-    for meta in recent_jobs(usize::MAX)? {
-        if meta.ssh_target.is_none() || meta.resumed_at.is_some() {
+    for mut meta in recent_jobs(usize::MAX)? {
+        if meta.resumed_at.is_some() {
+            let path = job_dir(&meta.job_id)?.join("request.json");
+            if path.exists() {
+                clear_persisted_environment(&meta.job_id, &read_request(&path)?)?;
+            }
+            continue;
+        }
+        if meta.resume_error.is_some() {
+            continue;
+        }
+        if meta.ssh_target.is_none() && meta.exit_status.is_none() {
+            meta.resume_error = Some("local supervisor was interrupted; exit status is unknown; inspect the process and logs manually".into());
+            write_meta(&meta)?;
+            let path = job_dir(&meta.job_id)?.join("request.json");
+            if path.exists() {
+                clear_persisted_environment(&meta.job_id, &read_request(&path)?)?;
+            }
             continue;
         }
         let request_path = job_dir(&meta.job_id)?.join("request.json");
@@ -230,19 +248,30 @@ pub fn recover_remote_jobs() -> Result<Vec<Completion>> {
                 continue;
             }
         };
-        let target = request
-            .ssh_target
-            .as_deref()
-            .context("missing SSH target")?;
-        let (stdout_path, stderr_path) = remote_log_paths(target, &meta.job_id);
-        completions
-            .push(Box::pin(monitor_remote(request, meta, stdout_path, stderr_path)) as Completion);
+        if let Some(target) = request.ssh_target.as_deref() {
+            let (stdout_path, stderr_path) = remote_log_paths(target, &meta.job_id);
+            completions.push(
+                Box::pin(monitor_remote(request, meta, stdout_path, stderr_path)) as Completion,
+            );
+        } else {
+            let dir = job_dir(&meta.job_id)?;
+            completions.push(Box::pin(finish_resume(
+                request,
+                meta,
+                dir.join("stdout.log"),
+                dir.join("stderr.log"),
+            )) as Completion);
+        }
     }
     Ok(completions)
 }
 
-async fn launch_remote(target: &str, script: &str) -> Result<u32> {
-    let mut child = ssh_command(target)
+async fn launch_remote(
+    target: &str,
+    script: &str,
+    env_vars: &HashMap<String, String>,
+) -> Result<u32> {
+    let mut child = ssh_command(target, env_vars)
         .args(["sh", "-s"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -277,7 +306,7 @@ async fn monitor_remote(
     stderr_path: PathBuf,
 ) -> Result<()> {
     if meta.exit_status.is_some() {
-        return resume_remote(request, meta, stdout_path, stderr_path).await;
+        return finish_resume(request, meta, stdout_path, stderr_path).await;
     }
     let target = request
         .ssh_target
@@ -288,7 +317,11 @@ async fn monitor_remote(
         meta.job_id
     );
     loop {
-        match ssh_command(target).arg(&exit_command).output().await {
+        match ssh_command(target, &request.env_vars)
+            .arg(&exit_command)
+            .output()
+            .await
+        {
             Ok(output) if output.status.success() => {
                 let code: i32 = String::from_utf8_lossy(&output.stdout)
                     .trim()
@@ -297,28 +330,61 @@ async fn monitor_remote(
                 meta.finished_at = Some(now_secs());
                 meta.exit_status = Some(status_record_from_code(code));
                 write_meta(&meta)?;
-                return resume_remote(request, meta, stdout_path, stderr_path).await;
+                return finish_resume(request, meta, stdout_path, stderr_path).await;
             }
             _ => sleep(Duration::from_secs(5)).await,
         }
     }
 }
 
-async fn resume_remote(
+async fn finish_resume(
     request: JobSubmitRequest,
     mut meta: JobMeta,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
 ) -> Result<()> {
-    resumer::resume(&request, &meta, &stdout_path, &stderr_path).await?;
+    if let Err(error) = resumer::resume(&request, &meta, &stdout_path, &stderr_path).await {
+        meta.resume_error = Some(format!("{error:#}"));
+        write_meta(&meta)?;
+        return Err(error);
+    }
     meta.resumed_at = Some(now_secs());
-    write_meta(&meta)
+    meta.resume_error = None;
+    write_meta(&meta)?;
+    clear_persisted_environment(&meta.job_id, &request)
 }
 
-fn ssh_command(target: &str) -> Command {
+pub fn retry_resume(job_id: &str) -> Result<Completion> {
+    let dir = job_dir(job_id)?;
+    let mut meta = read_meta(&dir.join("meta.json"))?;
+    if meta.exit_status.is_none() || meta.resumed_at.is_some() || meta.resume_error.is_none() {
+        bail!("only completed jobs with a failed wake-up can be retried");
+    }
+    let request = read_request(&dir.join("request.json"))?;
+    let (stdout, stderr) = match request.ssh_target.as_deref() {
+        Some(target) => remote_log_paths(target, job_id),
+        None => (dir.join("stdout.log"), dir.join("stderr.log")),
+    };
+    meta.resume_error = None;
+    write_meta(&meta)?;
+    Ok(Box::pin(finish_resume(request, meta, stdout, stderr)))
+}
+
+fn ssh_command(target: &str, env_vars: &HashMap<String, String>) -> Command {
     let mut command = Command::new("ssh");
     command
-        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
+        .env_clear()
+        .envs(env_vars)
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=2",
+        ])
         .arg(target);
     command
 }
@@ -345,7 +411,7 @@ fn remote_wrapper(job_id: &str, command: &str) -> String {
         shell_quote(command)
     );
     format!(
-        "set -eu\njob_dir=\"{remote_dir}\"\nmkdir -p \"$job_dir\"\nchmod 700 \"$HOME/.slumber\" \"$HOME/.slumber/jobs\" \"$job_dir\"\nrm -f \"$job_dir/exit_code\" \"$job_dir/exit_code.tmp\"\n: > \"$job_dir/stdout.log\"\n: > \"$job_dir/stderr.log\"\nchmod 600 \"$job_dir/stdout.log\" \"$job_dir/stderr.log\"\nnohup sh -c {} > \"$job_dir/stdout.log\" 2> \"$job_dir/stderr.log\" < /dev/null &\nprintf '%s\\n' \"$!\"\n",
+        "set -eu\numask 077\njob_dir=\"{remote_dir}\"\nmkdir -p \"$HOME/.slumber/jobs\"\nmkdir \"$job_dir\"\n: > \"$job_dir/stdout.log\"\n: > \"$job_dir/stderr.log\"\nnohup sh -c {} > \"$job_dir/stdout.log\" 2> \"$job_dir/stderr.log\" < /dev/null &\nprintf '%s\\n' \"$!\"\n",
         shell_quote(&worker)
     )
 }

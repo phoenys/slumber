@@ -1,15 +1,25 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     env,
-    fs::{self, File},
-    os::unix::fs::PermissionsExt,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const DAEMON_PROTOCOL_VERSION: &str = "3";
+pub const DAEMON_PROTOCOL_VERSION: &str = "5";
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum DaemonRequest {
+    Submit(JobSubmitRequest),
+    Ping,
+    Stop,
+    Retry { job_id: String },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSubmitRequest {
@@ -27,6 +37,7 @@ pub struct JobSubmitRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentKind {
     CodeX,
+    NoResume,
     GenericCommand { resume_template: String },
 }
 
@@ -57,6 +68,8 @@ pub struct JobMeta {
     pub resumed_at: Option<u64>,
     #[serde(default)]
     pub tmux_pane_id: Option<String>,
+    #[serde(default)]
+    pub resume_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,7 +88,11 @@ pub fn now_secs() -> u64 {
 
 pub fn state_dir() -> Result<PathBuf> {
     if let Some(path) = env::var_os("SLUMBER_HOME") {
-        return Ok(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            bail!("SLUMBER_HOME must be absolute");
+        }
+        return Ok(path);
     }
     let home = env::var_os("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".slumber"))
@@ -83,7 +100,11 @@ pub fn state_dir() -> Result<PathBuf> {
 
 pub fn socket_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("SLUMBER_SOCKET") {
-        return Ok(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            bail!("SLUMBER_SOCKET must be absolute");
+        }
+        return Ok(path);
     }
     if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
         return Ok(PathBuf::from(path).join("slumber/slumber.sock"));
@@ -96,28 +117,56 @@ pub fn jobs_dir() -> Result<PathBuf> {
 }
 
 pub fn create_private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
+        bail!(
+            "{} must be a directory owned by you with mode 0700; choose a private Slumber directory",
+            path.display()
+        );
+    }
     Ok(())
 }
 
 pub fn job_dir(job_id: &str) -> Result<PathBuf> {
+    if !job_id.starts_with("job_")
+        || !job_id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        bail!("invalid job id");
+    }
     Ok(jobs_dir()?.join(job_id))
 }
 
 pub fn write_meta(meta: &JobMeta) -> Result<()> {
     let path = job_dir(&meta.job_id)?.join("meta.json");
-    let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    serde_json::to_writer_pretty(file, meta).context("serialize job metadata")?;
-    Ok(())
+    write_private_atomic(&path, &serde_json::to_vec_pretty(meta)?)
 }
 
 pub fn write_request(job_id: &str, request: &JobSubmitRequest) -> Result<()> {
     let path = job_dir(job_id)?.join("request.json");
-    let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    serde_json::to_writer_pretty(file, request).context("serialize job request")?;
+    write_private_atomic(&path, &serde_json::to_vec_pretty(request)?)
+}
+
+pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temporary = path.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
     Ok(())
 }
 
