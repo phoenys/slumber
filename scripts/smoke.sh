@@ -27,7 +27,8 @@ clean_env "$slumber" status
 clean_env "$slumber" init --agent codex --file "$smoke_dir/bad.md" && exit 1
 clean_env "$slumber" init --file "$smoke_dir/AGENTS.md"
 clean_env "$slumber" init --file "$smoke_dir/AGENTS.md"
-[ "$(grep -c 'SLUMBER PROTOCOL' "$smoke_dir/AGENTS.md")" -eq 1 ]
+[ "$(grep -c '^<!-- SLUMBER PROTOCOL -->$' "$smoke_dir/AGENTS.md")" -eq 1 ]
+[ "$(grep -c '^<!-- /SLUMBER PROTOCOL -->$' "$smoke_dir/AGENTS.md")" -eq 1 ]
 wait_done() {
     job=$1
     attempt=0
