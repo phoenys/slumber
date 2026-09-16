@@ -1,0 +1,8 @@
+AGENTS.md
+/target
+/docs
+/.dogfood
+/.slumber/
+.env
+.env.*
+!.env.example

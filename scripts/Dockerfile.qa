@@ -1,0 +1,8 @@
+FROM rust:1.89-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-server tmux shellcheck python3 \
+    && useradd -m -s /bin/sh tester
+RUN rustup component add rustfmt clippy
+WORKDIR /work
+COPY --chown=tester:tester . .
+RUN chown tester:tester /work
+CMD ["sh", "scripts/container-qa.sh"]

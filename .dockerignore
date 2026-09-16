@@ -1,0 +1,11 @@
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!tests/
+!tests/**
+!scripts/
+!scripts/**
+!install.sh
+!uninstall.sh
