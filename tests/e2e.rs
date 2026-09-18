@@ -601,6 +601,11 @@ printf 200
     )
     .unwrap();
     fs::set_permissions(curl, fs::Permissions::from_mode(0o700)).unwrap();
+    // Linux runners have gh in /usr/bin: never let the 404 fixture fall back
+    // to the real network or the runner's authentication configuration.
+    let gh = fake_bin.join("gh");
+    fs::write(&gh, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(gh, fs::Permissions::from_mode(0o700)).unwrap();
     let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh");
     let configure = |command: &mut Command| {
         isolated(command, &root);
@@ -640,9 +645,9 @@ printf 200
         .unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).unwrap();
-    assert!(error.contains("draft assets are unavailable anonymously"));
-    assert!(error.contains("--version <tag>"));
-    assert!(error.contains("--from /path/to/binary"));
+    assert!(error.contains("trying authenticated GitHub CLI"));
+    assert!(error.contains("GitHub download failed"));
+    assert!(error.contains("GH_CONFIG_DIR"));
     assert!(
         Command::new(root.join("installed/slumber"))
             .arg("--version")
