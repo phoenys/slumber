@@ -80,7 +80,7 @@ enum Commands {
     },
     /// Show running and recently completed jobs.
     Status {
-        /// Maximum number of recent jobs to display.
+        /// Maximum number of completed jobs; unresolved jobs are always shown.
         #[arg(long, default_value_t = 5)]
         limit: usize,
     },
@@ -103,6 +103,18 @@ enum Commands {
     },
     /// Check local prerequisites without submitting a job.
     Doctor,
+    /// Install the latest release (or a selected version) beside the current binary.
+    Update {
+        /// Release tag; defaults to the latest stable release.
+        #[arg(long, conflicts_with = "from")]
+        version: Option<String>,
+        /// Install an already downloaded binary, without network access.
+        #[arg(long, conflicts_with = "github")]
+        from: Option<PathBuf>,
+        /// Download using authenticated gh (for private repositories).
+        #[arg(long)]
+        github: bool,
+    },
     /// Retry a completed job's failed wake-up command.
     Retry { job_id: String },
     /// Run in the foreground, or explicitly manage the background daemon.
@@ -153,6 +165,11 @@ impl Cli {
             Commands::Logs { job_id, err } => logs(&job_id, err),
             Commands::Init { file, agent } => init(file.as_deref(), agent),
             Commands::Doctor => doctor().await,
+            Commands::Update {
+                version,
+                from,
+                github,
+            } => update(version, from, github),
             Commands::Retry { job_id } => {
                 job_dir(&job_id)?;
                 ensure_daemon().await?;
@@ -448,7 +465,18 @@ async fn doctor() -> Result<()> {
 }
 
 fn status(limit: usize) -> Result<()> {
-    let jobs = recent_jobs(limit)?;
+    let mut completed = 0;
+    let jobs: Vec<_> = recent_jobs(usize::MAX)?
+        .into_iter()
+        .filter(|meta| {
+            if meta.resumed_at.is_none() {
+                true
+            } else {
+                completed += 1;
+                completed <= limit
+            }
+        })
+        .collect();
     if jobs.is_empty() {
         println!("No jobs.");
         return Ok(());
@@ -480,11 +508,54 @@ fn status(limit: usize) -> Result<()> {
             meta.job_id, pgid, target, status, meta.command
         );
         if let Some(error) = meta.resume_error {
-            println!("  wake-up: FAILED: {error}");
+            if meta.exit_status.is_none() {
+                println!("  monitoring: STOPPED: {error}");
+            } else {
+                println!("  wake-up: FAILED: {error}");
+            }
         } else if meta.resumed_at.is_some() {
             println!("  wake-up: complete");
+        } else if meta.exit_status.is_some() {
+            println!("  wake-up: pending (saved state; query daemon status for live activity)");
         }
     }
+    Ok(())
+}
+
+fn update(version: Option<String>, from: Option<PathBuf>, github: bool) -> Result<()> {
+    let executable = env::current_exe()?;
+    if executable.file_name().and_then(|name| name.to_str()) != Some("slumber") {
+        bail!("self-update requires a binary named slumber; use install.sh --from instead");
+    }
+    let directory = executable
+        .parent()
+        .context("binary has no parent directory")?;
+    let mut command = Command::new("sh");
+    command
+        .args(["-s", "--"])
+        .env("SLUMBER_INSTALL_DIR", directory)
+        .env_remove("SLUMBER_VERSION")
+        .stdin(Stdio::piped());
+    if let Some(version) = version {
+        command.args(["--version", &version]);
+    }
+    if let Some(from) = from {
+        command.arg("--from").arg(from);
+    }
+    if github {
+        command.arg("--github");
+    }
+    let mut child = command.spawn().context("start embedded installer")?;
+    let written = child
+        .stdin
+        .take()
+        .context("open installer input")?
+        .write_all(include_bytes!("../install.sh"));
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("update failed; see the installer error above");
+    }
+    written?;
     Ok(())
 }
 

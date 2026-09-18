@@ -245,6 +245,10 @@ pub fn recover_jobs() -> Result<Vec<Completion>> {
         let request = match read_request(&request_path) {
             Ok(request) => request,
             Err(error) => {
+                meta.resume_error = Some(format!(
+                    "cannot recover job: {error:#}; inspect its saved state manually"
+                ));
+                write_meta(&meta)?;
                 eprintln!(
                     "slumberd: cannot recover remote job {}: {error:#}",
                     meta.job_id
@@ -316,10 +320,7 @@ async fn monitor_remote(
         .ssh_target
         .as_deref()
         .context("missing SSH target")?;
-    let exit_command = format!(
-        "cat \"$HOME/.slumber/jobs/{}/exit_code\" 2>/dev/null",
-        meta.job_id
-    );
+    let exit_command = remote_probe(&meta)?;
     loop {
         match ssh_command(target, &request.env_vars)
             .arg(&exit_command)
@@ -327,10 +328,27 @@ async fn monitor_remote(
             .await
         {
             Ok(output) if output.status.success() => {
-                let code: i32 = String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .parse()
-                    .context("remote exit_code is invalid")?;
+                let result = String::from_utf8_lossy(&output.stdout);
+                if result.trim() == "running" {
+                    sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                let code = result.trim().parse::<i32>();
+                let code = match code {
+                    Ok(code) => code,
+                    Err(_) => {
+                        let reason = if result.trim() == "missing" {
+                            "remote process disappeared without an exit record; outcome is unknown"
+                        } else {
+                            "remote exit record is invalid; outcome is unknown"
+                        };
+                        meta.resume_error = Some(format!(
+                            "{reason}; inspect remote work and logs manually before launching anything again"
+                        ));
+                        write_meta(&meta)?;
+                        bail!("{reason}");
+                    }
+                };
                 meta.finished_at = Some(now_secs());
                 meta.exit_status = Some(status_record_from_code(code));
                 write_meta(&meta)?;
@@ -339,6 +357,21 @@ async fn monitor_remote(
             _ => sleep(Duration::from_secs(5)).await,
         }
     }
+}
+
+fn remote_probe(meta: &JobMeta) -> Result<String> {
+    let pid = meta.pgid.context("remote job has no recorded process ID")?;
+    // Check the exit file again after probing the PID: the wrapper may have
+    // written it and exited between the first read and the liveness check.
+    Ok(format!(
+        "exit_file=\"$HOME/.slumber/jobs/{}/exit_code\"; \
+         if [ -f \"$exit_file\" ]; then cat \"$exit_file\"; \
+         elif ! command -v ps >/dev/null 2>&1; then exit 1; \
+         elif kill -0 {pid} 2>/dev/null || ps -p {pid} >/dev/null 2>&1; then printf 'running\\n'; \
+         elif [ -f \"$exit_file\" ]; then cat \"$exit_file\"; \
+         else printf 'missing\\n'; fi",
+        meta.job_id
+    ))
 }
 
 async fn finish_resume(
@@ -444,6 +477,33 @@ fn status_record_from_code(code: i32) -> ExitStatusRecord {
 mod tests {
     use super::*;
     use std::{fs, process::Command as StdCommand, thread, time::SystemTime};
+
+    #[test]
+    fn remote_probe_distinguishes_running_missing_and_recorded_exit() {
+        let root = std::env::temp_dir().join(format!("slumber-probe-{}", std::process::id()));
+        let directory = root.join(".slumber/jobs/job_probe");
+        fs::create_dir_all(&directory).unwrap();
+        let mut meta: JobMeta = serde_json::from_value(serde_json::json!({
+            "job_id": "job_probe", "command": "true", "cwd": "/", "created_at": 0,
+            "started_at": 0, "finished_at": null, "pgid": std::process::id(), "exit_status": null
+        }))
+        .unwrap();
+        let probe = |meta: &JobMeta| {
+            let output = StdCommand::new("sh")
+                .args(["-c", &remote_probe(meta).unwrap()])
+                .env("HOME", &root)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+        assert_eq!(probe(&meta), "running\n");
+        meta.pgid = Some(i32::MAX as u32);
+        assert_eq!(probe(&meta), "missing\n");
+        fs::write(directory.join("exit_code"), "7\n").unwrap();
+        assert_eq!(probe(&meta), "7\n");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn records_shell_signal_exit() {

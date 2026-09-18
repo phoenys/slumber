@@ -601,6 +601,11 @@ printf 200
     )
     .unwrap();
     fs::set_permissions(curl, fs::Permissions::from_mode(0o700)).unwrap();
+    // Linux runners have gh in /usr/bin: never let the 404 fixture fall back
+    // to the real network or the runner's authentication configuration.
+    let gh = fake_bin.join("gh");
+    fs::write(&gh, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(gh, fs::Permissions::from_mode(0o700)).unwrap();
     let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh");
     let configure = |command: &mut Command| {
         isolated(command, &root);
@@ -640,15 +645,272 @@ printf 200
         .unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).unwrap();
-    assert!(error.contains("draft assets are unavailable anonymously"));
-    assert!(error.contains("--version <tag>"));
-    assert!(error.contains("--from /path/to/binary"));
+    assert!(error.contains("trying authenticated GitHub CLI"));
+    assert!(error.contains("GitHub download failed"));
+    assert!(error.contains("GH_CONFIG_DIR"));
     assert!(
         Command::new(root.join("installed/slumber"))
             .arg("--version")
             .status()
             .unwrap()
             .success()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn missing_remote_exit_record_stops_monitoring_but_network_errors_do_not() {
+    let binary = env!("CARGO_BIN_EXE_slumber");
+    let root = temp_root("lost");
+    let fake_bin = root.join("bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let ssh = fake_bin.join("ssh");
+    fs::write(
+        &ssh,
+        r#"#!/bin/sh
+case "$*" in
+  *"sh -s"*) cat >/dev/null; printf '4242\n' ;;
+  *) touch "$SLUMBER_HOME/probed"
+     test -f "$SLUMBER_HOME/connected" || exit 255
+     printf 'missing\n' ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let configure = |command: &mut Command| {
+        isolated(command, &root);
+        command.env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()));
+    };
+    let mut run = Command::new(binary);
+    configure(&mut run);
+    let output = run
+        .args([
+            "run",
+            "--ssh",
+            "test-host",
+            "--no-tail",
+            "--no-resume",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let submission = String::from_utf8(output.stdout).unwrap();
+    let id = submission.split_whitespace().nth(1).unwrap();
+    let meta_path = root.join("state/jobs").join(id).join("meta.json");
+    for _ in 0..100 {
+        if root.join("state/probed").exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(root.join("state/probed").exists());
+    let mut stop = Command::new(binary);
+    configure(&mut stop);
+    assert!(
+        !stop
+            .args(["daemon", "stop"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let meta: serde_json::Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    assert!(meta["resume_error"].is_null());
+    fs::write(root.join("state/connected"), "").unwrap();
+    for _ in 0..500 {
+        if fs::read_to_string(&meta_path)
+            .unwrap()
+            .contains("outcome is unknown")
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let meta: serde_json::Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    assert!(
+        meta["resume_error"]
+            .as_str()
+            .unwrap()
+            .contains("outcome is unknown")
+    );
+    assert!(meta["exit_status"].is_null());
+    assert!(meta["resumed_at"].is_null());
+    let mut status = Command::new(binary);
+    configure(&mut status);
+    let output = status.args(["status", "--limit", "0"]).output().unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains(id) && text.contains("monitoring: STOPPED"));
+    let mut stop = Command::new(binary);
+    configure(&mut stop);
+    assert!(
+        stop.args(["daemon", "stop"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    // An unrecoverable historical record is persisted as an error, not hidden.
+    fs::remove_file(root.join("state/jobs").join(id).join("request.json")).unwrap();
+    let mut meta = meta;
+    meta["resume_error"] = serde_json::Value::Null;
+    fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    let mut start = Command::new(binary);
+    configure(&mut start);
+    assert!(
+        start
+            .args(["daemon", "start"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        fs::read_to_string(&meta_path)
+            .unwrap()
+            .contains("cannot recover job")
+    );
+    let mut stop = Command::new(binary);
+    configure(&mut stop);
+    assert!(
+        stop.args(["daemon", "stop"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn self_update_preserves_active_jobs_and_supports_authenticated_downloads() {
+    let binary = env!("CARGO_BIN_EXE_slumber");
+    let root = temp_root("update");
+    let installed = root.join("installed/slumber");
+    fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    fs::copy(binary, &installed).unwrap();
+    let fake_bin = root.join("bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let gh = fake_bin.join("gh");
+    fs::write(
+        &gh,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" > "$SLUMBER_HOME/download-args"
+test "${FAIL_DOWNLOAD-}" != 1 || exit 1
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dir) destination=$2; shift 2 ;;
+    --pattern) asset=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+cp "$TEST_BINARY" "$destination/$asset"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+    let configure = |command: &mut Command| {
+        isolated(command, &root);
+        command
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+            .env("TEST_BINARY", binary)
+            .env("SLUMBER_INSTALL_DIR", root.join("must-not-use"));
+    };
+    let mut run = Command::new(&installed);
+    configure(&mut run);
+    assert!(run.args(["run", "--no-resume", "--no-tail", "attempt=0; while [ ! -f \"$SLUMBER_HOME/finish\" ] && [ \"$attempt\" -lt 200 ]; do sleep 0.05; attempt=$((attempt + 1)); done"]).output().unwrap().status.success());
+    let mut blocked = Command::new(&installed);
+    configure(&mut blocked);
+    let output = blocked.args(["update", "--from", binary]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("still active"));
+    fs::write(root.join("state/finish"), "").unwrap();
+    for _ in 0..100 {
+        let mut stop = Command::new(&installed);
+        configure(&mut stop);
+        if stop
+            .args(["daemon", "stop"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let bad = root.join("bad-binary");
+    fs::write(&bad, "#!/bin/sh\necho not-slumber\n").unwrap();
+    let mut invalid = Command::new(&installed);
+    configure(&mut invalid);
+    assert!(
+        !invalid
+            .arg("update")
+            .arg("--from")
+            .arg(&bad)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let mut failed = Command::new(&installed);
+    configure(&mut failed);
+    assert!(
+        !failed
+            .env("FAIL_DOWNLOAD", "1")
+            .args(["update", "--github"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    for tag in [None, Some("v0.1.1")] {
+        let mut update = Command::new(&installed);
+        configure(&mut update);
+        update.args(["update", "--github"]);
+        if let Some(tag) = tag {
+            update.args(["--version", tag]);
+        }
+        let output = update.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let args = fs::read_to_string(root.join("state/download-args")).unwrap();
+        assert!(args.contains("--repo phoenys/slumber"));
+        assert_eq!(args.contains("v0.1.1"), tag.is_some());
+    }
+    assert!(!root.join("must-not-use").exists());
+    let curl = fake_bin.join("curl");
+    fs::write(&curl, "#!/bin/sh\nprintf 404\nexit 22\n").unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut fallback = Command::new(&installed);
+    configure(&mut fallback);
+    let output = fallback.arg("update").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("trying authenticated GitHub CLI"));
+    assert!(
+        Command::new(&installed)
+            .arg("--version")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::read_dir(installed.parent().unwrap()).unwrap().count(),
+        1
     );
     fs::remove_dir_all(root).unwrap();
 }

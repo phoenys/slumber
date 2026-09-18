@@ -192,6 +192,19 @@ Keep the local daemon running while local jobs execute. Local process state cann
 
 Wait for jobs and wake-ups to finish before upgrading. The installer stops an idle existing daemon, then replaces its binary. When migrating from an early MVP daemon without `daemon stop`, finish its jobs and stop that old daemon manually before upgrading. Do not kill it during a local job.
 
+Starting with 0.1.2, update the currently running executable's installation (not another copy in PATH):
+
+```sh
+slumber update                         # latest stable release
+slumber update --version v0.1.2        # explicit release, including rollback
+slumber update --github                # authenticated gh, including private repos
+slumber update --from /path/to/slumber  # offline installation
+```
+
+The command uses its embedded installer, stages and checks the new binary before stopping an idle daemon, then atomically replaces the installed file. It never bypasses active-task protection, uses sudo, edits your shell configuration or deletes job records. An anonymous HTTP 404 automatically falls back to `gh` if available; `--github` skips the anonymous attempt. Authenticate `gh` with access to this repository; its normal `GH_CONFIG_DIR` setting is honored. Older versions without `update` need one installation using the checkout's `install.sh --from` (or `--github`) first. Package-manager installations should be upgraded through their package manager. Symlinked launchers resolve to the actual executable location.
+
+`daemon status` counts task monitors and wake-up hooks, not just running experiment processes. `status --limit N` limits completed history; unresolved jobs are always shown, even if old. If a successful remote probe finds neither the recorded process nor its exit record, monitoring stops and the result is marked **unknown**, never success. Descendant work could still exist: inspect the remote workload and logs before relaunching anything. SSH/network failures continue monitoring; a reused PID can also keep a monitor waiting. Missing recovery files and invalid exit records are reported explicitly. Unknown/failed records remain for diagnosis and do not themselves block an idle daemon from stopping. `retry` retries a failed wake-up with a known exit status, not an unknown task or the task itself.
+
 ```sh
 # After scripts are publicly available:
 curl -fsSL https://raw.githubusercontent.com/phoenys/slumber/main/uninstall.sh | sh

@@ -1,3 +1,9 @@
+# Slumber 0.1.2
+
+- Stop monitoring with an explicit unknown outcome when a successful SSH probe confirms the recorded process is gone and no exit record exists. Keep monitoring during connection failures; check the exit file again after probing to avoid a completion race.
+- Always show unresolved jobs regardless of the completed-history limit, and persist recovery errors for missing request files.
+- Add `slumber update` using the embedded installer, with latest/selected releases, offline installation and authenticated GitHub downloads. Preserve active-job protection, atomic replacement and the original binary on pre-install failure.
+
 # Slumber 0.1.1
 
 Initial distribution of the local/one-SSH-server MVP, including the fixes below. The repository remains private; download assets with an authorized GitHub account. See RELEASING.md for verification and rollback.
