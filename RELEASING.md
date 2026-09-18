@@ -2,9 +2,9 @@
 
 ## Scope and distribution
 
-Version 0.1.1 covers one local machine and one SSH server, with Codex or a trusted custom wake-up hook. Other agents, multi-server orchestration and clusters are outside this release. Cargo registry publication is disabled; distribute the four native GitHub release binaries.
+The 0.1 series covers one local machine and one SSH server, with Codex or a trusted custom wake-up hook. Other agents, multi-server orchestration and clusters are outside this release. Cargo registry publication is disabled; distribute the four native GitHub release binaries.
 
-The repository is private. Publishing a release does not make its assets public: authorized users must download through GitHub or `gh release download`, then use `install.sh --from`. Keep repository visibility private unless the owner explicitly approves a public transition. Anonymous installer verification is a separate gate after that transition.
+Repository visibility is controlled by the owner. In a private repository, publishing a release does not make its assets public: authorized users must download through GitHub, `slumber update --github` or `gh release download`, then use `install.sh --from` when needed. Preserve the current visibility unless the owner explicitly requests a change. Anonymous installer verification is a separate gate when the repository is public.
 
 The repository was initialized with a clean source snapshot after a privacy review. Do not import prior Git history, old tags, diagnostic dumps or personal development notes. Earlier CI links are not evidence for this repository. Record current evidence in the release notes using the release commit and its Actions run, without private identifiers.
 
