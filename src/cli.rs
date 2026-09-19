@@ -1,7 +1,8 @@
 use crate::{
     core::{
-        AgentKind, DAEMON_PROTOCOL_VERSION, DaemonRequest, JobSubmitRequest, JobSubmitResponse,
-        create_private_dir, exit_status_text, job_dir, recent_jobs, socket_path, state_dir,
+        AgentKind, DAEMON_PROTOCOL_VERSION, DaemonRequest, JobMeta, JobSubmitRequest,
+        JobSubmitResponse, create_private_dir, exit_status_text, job_dir, now_secs, recent_jobs,
+        socket_path, state_dir,
     },
     daemon,
 };
@@ -78,11 +79,17 @@ enum Commands {
         #[arg(long, conflicts_with_all = ["session_id", "resume_template"])]
         no_resume: bool,
     },
-    /// Show running and recently completed jobs.
+    /// Show running jobs and outcomes from the preceding 24 hours (saved state).
     Status {
-        /// Maximum number of completed jobs; unresolved jobs are always shown.
-        #[arg(long, default_value_t = 5)]
-        limit: usize,
+        /// Cap completed/stopped records; running jobs are always shown. Default: no cap.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Show all saved jobs, including outcomes older than 24 hours.
+    History {
+        /// Cap completed/stopped records; running jobs are always shown. Default: no cap.
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Print the full current stdout log (or --err); fetch SSH logs remotely. Does not follow.
     Logs {
@@ -161,7 +168,8 @@ impl Cli {
                 )
                 .await
             }
-            Commands::Status { limit } => status(limit),
+            Commands::Status { limit } => list_jobs(Some(now_secs().saturating_sub(86_400)), limit),
+            Commands::History { limit } => list_jobs(None, limit),
             Commands::Logs { job_id, err } => logs(&job_id, err),
             Commands::Init { file, agent } => init(file.as_deref(), agent),
             Commands::Doctor => doctor().await,
@@ -464,21 +472,37 @@ async fn doctor() -> Result<()> {
     manage_daemon(DaemonAction::Status).await
 }
 
-fn status(limit: usize) -> Result<()> {
+fn select_jobs(jobs: Vec<JobMeta>, since: Option<u64>, limit: Option<usize>) -> Vec<JobMeta> {
     let mut completed = 0;
-    let jobs: Vec<_> = recent_jobs(usize::MAX)?
-        .into_iter()
+    jobs.into_iter()
         .filter(|meta| {
-            if meta.resumed_at.is_none() {
-                true
-            } else {
-                completed += 1;
-                completed <= limit
+            if meta.exit_status.is_none() && meta.resume_error.is_none() {
+                return true;
             }
+
+            // Unknown outcomes have no exit timestamp. Use their recorded start
+            // (or submission) time without inventing an exit time or exit status.
+            let outcome_at = meta
+                .finished_at
+                .or(meta.started_at)
+                .unwrap_or(meta.created_at);
+            if since.is_some_and(|cutoff| outcome_at < cutoff) {
+                return false;
+            }
+            completed += 1;
+            limit.is_none_or(|limit| completed <= limit)
         })
-        .collect();
+        .collect()
+}
+
+fn list_jobs(since: Option<u64>, limit: Option<usize>) -> Result<()> {
+    let jobs = select_jobs(recent_jobs(usize::MAX)?, since, limit);
     if jobs.is_empty() {
-        println!("No jobs.");
+        if since.is_some() {
+            println!("No jobs match the current view. Use `slumber history` for all saved jobs.");
+        } else {
+            println!("No jobs match the history view.");
+        }
         return Ok(());
     }
 
@@ -635,4 +659,60 @@ fn init(file: Option<&Path>, agent: Option<InitAgent>) -> Result<()> {
     write!(output, "{PROTOCOL}")?;
     println!("Added Slumber protocol to {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::ExitStatusRecord;
+
+    #[test]
+    fn status_window_uses_exit_time_independently_of_wake_up() {
+        let now = 3 * 86_400 + 12 * 3_600;
+        let cutoff = now - 86_400;
+        let mut meta = JobMeta {
+            job_id: "test-job".into(),
+            command: "true".into(),
+            cwd: PathBuf::from("/tmp"),
+            created_at: 1,
+            started_at: Some(2),
+            finished_at: Some(cutoff),
+            pgid: None,
+            exit_status: Some(ExitStatusRecord::Exited(0)),
+            ssh_target: None,
+            resumed_at: None,
+            tmux_pane_id: None,
+            resume_error: None,
+        };
+        // Exactly 24 hours ago is included, even for a task started much earlier.
+        // Late wake-up success/failure must not make an old exit recent again.
+        for (resumed_at, error) in [
+            (None, None),
+            (Some(now), None),
+            (None, Some("hook failed".to_owned())),
+        ] {
+            meta.resumed_at = resumed_at;
+            meta.resume_error = error;
+            for (finished_at, visible) in [(cutoff - 1, false), (cutoff, true), (now, true)] {
+                meta.finished_at = Some(finished_at);
+                assert_eq!(
+                    !select_jobs(vec![meta.clone()], Some(cutoff), None).is_empty(),
+                    visible
+                );
+            }
+        }
+        meta.exit_status = None;
+        meta.finished_at = None;
+        // Stopped/unknown records fall back to start, then submission time.
+        assert!(select_jobs(vec![meta.clone()], Some(cutoff), None).is_empty());
+        meta.started_at = Some(cutoff);
+        assert_eq!(select_jobs(vec![meta.clone()], Some(cutoff), None).len(), 1);
+        meta.started_at = None;
+        meta.created_at = cutoff;
+        assert_eq!(select_jobs(vec![meta.clone()], Some(cutoff), None).len(), 1);
+        meta.created_at = 1;
+        // Actual running records bypass both the time window and the count cap.
+        meta.resume_error = None;
+        assert_eq!(select_jobs(vec![meta], Some(cutoff), Some(0)).len(), 1);
+    }
 }

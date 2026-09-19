@@ -28,6 +28,85 @@ fn isolated(command: &mut Command, root: &Path) {
 }
 
 #[test]
+fn status_is_recent_and_history_is_complete_without_starting_daemon() {
+    let root = temp_root("views");
+    let query = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_slumber"));
+        isolated(&mut command, &root);
+        let output = command.args(args).output().unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(query(&["status"]).contains("slumber history"));
+    assert!(query(&["history"]).contains("No jobs"));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut saved = Vec::new();
+    for index in 0..10 {
+        let id = format!("fixture-{index}");
+        let job_dir = root.join("state/jobs").join(&id);
+        fs::create_dir_all(&job_dir).unwrap();
+        let mut meta = serde_json::json!({
+            "job_id": id, "command": "true", "cwd": "/tmp",
+            "created_at": now - 100_000 + index,
+            "started_at": now - 100_000 + index,
+            "finished_at": now - 60, "pgid": null,
+            "exit_status": {"Exited": 0}, "resumed_at": now - 30,
+        });
+        match index {
+            0 => {
+                // Running, despite an old submission.
+                meta["exit_status"] = serde_json::Value::Null;
+                meta["finished_at"] = serde_json::Value::Null;
+                meta["resumed_at"] = serde_json::Value::Null;
+            }
+            1 => {
+                // Old task exit, even though wake-up was recent.
+                meta["finished_at"] = (now - 90_000).into();
+            }
+            2 => {
+                // Old stopped monitor, unknown task outcome.
+                meta["exit_status"] = serde_json::Value::Null;
+                meta["finished_at"] = serde_json::Value::Null;
+                meta["resumed_at"] = serde_json::Value::Null;
+                meta["resume_error"] = "outcome unknown".into();
+            }
+            3 => {
+                // Recent failure with pending wake-up.
+                meta["exit_status"] = serde_json::json!({"Exited": 7});
+                meta["resumed_at"] = serde_json::Value::Null;
+            }
+            _ => {}
+        }
+        let path = job_dir.join("meta.json");
+        let contents = serde_json::to_vec(&meta).unwrap();
+        fs::write(&path, &contents).unwrap();
+        saved.push((path, contents));
+    }
+    let status = query(&["status"]);
+    let history = query(&["history"]);
+    let running = query(&["status", "--limit", "0"]);
+    let limited = query(&["history", "--limit", "1"]);
+    for index in 0..10 {
+        let id = format!("fixture-{index}");
+        assert_eq!(status.contains(&id), index != 1 && index != 2);
+        assert!(history.contains(&id));
+        assert_eq!(running.contains(&id), index == 0);
+        assert_eq!(limited.contains(&id), index == 0 || index == 9);
+    }
+    assert!(status.contains("wake-up: pending"));
+    assert!(history.contains("monitoring: STOPPED"));
+    assert!(!root.join("slumber.sock").exists());
+    assert!(!root.join("state/slumberd.pid").exists());
+    for (path, contents) in saved {
+        assert_eq!(fs::read(path).unwrap(), contents);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn delegates_records_and_resumes_a_job() {
     let binary = env!("CARGO_BIN_EXE_slumber");
     let root = temp_root("e2e");
@@ -743,7 +822,7 @@ esac
     assert!(meta["resumed_at"].is_null());
     let mut status = Command::new(binary);
     configure(&mut status);
-    let output = status.args(["status", "--limit", "0"]).output().unwrap();
+    let output = status.arg("status").output().unwrap();
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains(id) && text.contains("monitoring: STOPPED"));
     let mut stop = Command::new(binary);

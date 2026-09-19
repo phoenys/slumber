@@ -1,3 +1,8 @@
+# Unreleased
+
+- Make `slumber status` show running jobs plus outcomes from the rolling previous 24 hours, with no default count cap. Filter completed jobs by exit time regardless of wake-up state; stopped/unknown records without an exit time use their start or submission time.
+- Add `slumber history` for all saved jobs. Both views accept `--limit N` to cap completed/stopped records while keeping running jobs visible; listing never deletes historical data.
+
 # Slumber 0.1.2
 
 - Stop monitoring with an explicit unknown outcome when a successful SSH probe confirms the recorded process is gone and no exit record exists. Keep monitoring during connection failures; check the exit file again after probing to avoid a completion race.
