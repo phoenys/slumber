@@ -6,18 +6,20 @@ Hand off a long shell command, let your coding agent stop working, and send its 
 
 ## Install
 
-While the repository is private, download the binary for your platform from [Releases](https://github.com/phoenys/slumber/releases) using an authorized GitHub account, then install from your checkout:
-
-```sh
-gh release download v0.1.1 --repo phoenys/slumber --pattern slumber-aarch64-apple-darwin
-sh install.sh --from "$PWD/slumber-aarch64-apple-darwin"
-```
-
-The example is for Apple Silicon; select the matching asset for another platform. It requires a published release, not a draft. Anonymous installation is available only after the repository and release are public:
+Install the latest published release without a GitHub account:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/phoenys/slumber/main/install.sh | sh
 ```
+
+Alternatively, download the binary for your platform from [Releases](https://github.com/phoenys/slumber/releases), then install from your checkout:
+
+```sh
+gh release download v0.1.3 --repo phoenys/slumber --pattern slumber-aarch64-apple-darwin
+sh install.sh --from "$PWD/slumber-aarch64-apple-darwin"
+```
+
+The download example is for Apple Silicon; select the matching asset for another platform. Anonymous downloads require a published release, not a draft. The installer also supports authenticated downloads through `--github`.
 
 The installer downloads a binary into `~/.local/bin/slumber`, uses no sudo, and never edits shell profiles or dotfiles. If that directory is not in PATH, add it for the current terminal:
 
@@ -26,7 +28,7 @@ export PATH="$HOME/.local/bin:$PATH"
 slumber doctor
 ```
 
-For a specific release, use `sh -s -- --version v0.1.1` after the pipe. `SLUMBER_INSTALL_DIR` selects another absolute installation directory. Read the script before running it if you prefer; binaries are also available from [GitHub Releases](https://github.com/phoenys/slumber/releases).
+For a specific release, use `sh -s -- --version v0.1.3` after the pipe. `SLUMBER_INSTALL_DIR` selects another absolute installation directory. Read the script before running it if you prefer; binaries are also available from [GitHub Releases](https://github.com/phoenys/slumber/releases).
 
 If the installer reports **No published binary found**, check that Releases contains a published release with the binary for your platform. Making the repository public or pushing a tag does not publish draft assets. The default `latest` URL requires a stable release; a published prerelease needs `--version <tag>`. Until assets are published, use the checkout build and `--from` instructions below. The installer does not silently install a compiler or build from source.
 
@@ -211,7 +213,7 @@ The command uses its embedded installer, stages and checks the new binary before
 `daemon status` counts task monitors and wake-up hooks, not just running experiment processes. This live count is different from the saved task outcomes shown by `status` and `history`; a wake-up hook can remain active after task exit. If a successful remote probe finds neither the recorded process nor its exit record, monitoring stops and the result is marked **unknown**, never success. Descendant work could still exist: inspect the remote workload and logs before relaunching anything. SSH/network failures continue monitoring; a reused PID can also keep a monitor waiting. Missing recovery files and invalid exit records are reported explicitly. Unknown/failed records remain in `history` for diagnosis and do not themselves block an idle daemon from stopping. `retry` retries a failed wake-up with a known exit status, not an unknown task or the task itself.
 
 ```sh
-# After scripts are publicly available:
+# Remove the binary while retaining local state:
 curl -fsSL https://raw.githubusercontent.com/phoenys/slumber/main/uninstall.sh | sh
 # Also permanently delete local configuration, credentials and logs (asks for confirmation):
 curl -fsSL https://raw.githubusercontent.com/phoenys/slumber/main/uninstall.sh | sh -s -- --purge

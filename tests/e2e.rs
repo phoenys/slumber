@@ -107,6 +107,52 @@ fn status_is_recent_and_history_is_complete_without_starting_daemon() {
 }
 
 #[test]
+fn daemon_stop_waits_for_shutdown_lock_release() {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixListener,
+    };
+
+    let root = temp_root("stop");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_slumber"));
+    isolated(&mut command, &root);
+    fs::create_dir_all(root.join("state")).unwrap();
+    let lock = fs::File::create(root.join("state/daemon.lock")).unwrap();
+    lock.lock().unwrap();
+    let socket = root.join("slumber.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let mut child = command
+        .args(["daemon", "stop"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The CLI first probes the socket, then connects again to send Stop.
+    drop(listener.accept().unwrap());
+    let (mut stream, _) = listener.accept().unwrap();
+    let mut request = String::new();
+    BufReader::new(&stream).read_line(&mut request).unwrap();
+    assert!(request.contains("Stop"));
+    stream
+        .write_all(b"{\"message\":\"Daemon stopped.\"}\n")
+        .unwrap();
+    fs::remove_file(socket).unwrap();
+    drop(listener);
+    // Simulate the shutdown interval after unlinking the socket but before
+    // releasing the lock. The caller must not report success in this interval.
+    thread::sleep(Duration::from_millis(150));
+    let exited_before_unlock = child.try_wait().unwrap().is_some();
+    drop(lock);
+    let output = child.wait_with_output().unwrap();
+    fs::remove_dir_all(root).unwrap();
+    assert!(
+        !exited_before_unlock,
+        "stop returned before shutdown completed"
+    );
+    assert!(output.status.success(), "{:?}", output);
+}
+
+#[test]
 fn delegates_records_and_resumes_a_job() {
     let binary = env!("CARGO_BIN_EXE_slumber");
     let root = temp_root("e2e");

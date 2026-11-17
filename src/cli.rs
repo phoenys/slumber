@@ -418,8 +418,14 @@ async fn manage_daemon(action: DaemonAction) -> Result<()> {
     })
     .await?;
     if matches!(action, DaemonAction::Stop) {
+        let lock = OpenOptions::new()
+            .write(true)
+            .open(state_dir()?.join("daemon.lock"))
+            .context("open daemon shutdown lock")?;
         for _ in 0..100 {
-            if !socket_path()?.exists() {
+            // Socket removal precedes final cleanup and lock release. Wait for
+            // both so an immediate restart cannot race the exiting daemon.
+            if !socket_path()?.exists() && lock.try_lock().is_ok() {
                 println!("Daemon stopped.");
                 return Ok(());
             }
