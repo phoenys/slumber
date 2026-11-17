@@ -109,7 +109,8 @@ Remote stdout, stderr and exit status live under `~/.slumber/jobs/<job-id>/` on 
 ## Logs, failures and daemon lifecycle
 
 ```sh
-slumber status                     # task outcome and wake-up errors
+slumber status                     # running tasks + outcomes from the last 24 hours
+slumber history                    # all saved jobs, including older outcomes
 slumber logs <job-id> --err
 slumber retry <job-id>              # retry a completed task's failed wake-up
 slumber doctor
@@ -118,6 +119,10 @@ slumber daemon start                # explicitly start in the background
 slumber daemon stop                 # refuse while jobs/wake-ups are active
 slumber daemon                     # run in this terminal, in the foreground
 ```
+
+`status` uses a rolling 24-hour window measured at query time, not the calendar day. Running records are always included; completed tasks are filtered by task exit time, whether wake-up succeeded, failed or is pending. There is no default count cap. `history` shows all saved records without a time window. Both list newest submissions first; optional `--limit N` caps completed/stopped records without hiding running ones (`status --limit 0` shows only running records). Neither command deletes data or contacts the daemon/remote host.
+
+Stopped monitors with an unknown outcome have no exit timestamp: their start time (or submission time if unavailable) is used for filtering. This is not evidence that the task exited; an old unknown result, including a newly detected problem with an old task, may appear only in `history`. Check `history` when diagnosing recovery or missing feedback.
 
 Wake-up failures are recorded in `meta.json`, `resume.log` and the daemon log. Inspect the error, correct the cause, and retry. Retry uses the original environment; changed credentials require a new submission or a deliberately updated private snapshot. Automatic replay after a crash can deliver a duplicate event; exactly-once delivery is not guaranteed.
 
@@ -164,7 +169,7 @@ To recover:
    slumber logs <job-id> --err
    ```
 
-4. If status reports a failed wake-up, inspect the job's `resume.log`, correct the cause, then run `slumber retry <job-id>`. This retries notification, not the remote task. If wake-up was already recorded as successful but the agent did not act, retry is not available; inspect the saved `payload.md` and bring the result to the original conversation manually.
+4. Use `slumber history` to inspect older outcomes outside the status window. If either view reports a failed wake-up, inspect the job's `resume.log`, correct the cause, then run `slumber retry <job-id>`. This retries notification, not the remote task. If wake-up was already recorded as successful but the agent did not act, retry is not available; inspect the saved `payload.md` and bring the result to the original conversation manually.
 
 Recovery uses the original request environment. After reboot, a saved `SSH_AUTH_SOCK` or another temporary endpoint may no longer exist. Working SSH in a new terminal therefore does not necessarily prove the saved monitor environment works. The current version does not refresh these values automatically; see the private-snapshot precautions above rather than resubmitting an existing job or copying credentials into bug reports.
 
@@ -203,7 +208,7 @@ slumber update --from /path/to/slumber  # offline installation
 
 The command uses its embedded installer, stages and checks the new binary before stopping an idle daemon, then atomically replaces the installed file. It never bypasses active-task protection, uses sudo, edits your shell configuration or deletes job records. An anonymous HTTP 404 automatically falls back to `gh` if available; `--github` skips the anonymous attempt. Authenticate `gh` with access to this repository; its normal `GH_CONFIG_DIR` setting is honored. Older versions without `update` need one installation using the checkout's `install.sh --from` (or `--github`) first. Package-manager installations should be upgraded through their package manager. Symlinked launchers resolve to the actual executable location.
 
-`daemon status` counts task monitors and wake-up hooks, not just running experiment processes. `status --limit N` limits completed history; unresolved jobs are always shown, even if old. If a successful remote probe finds neither the recorded process nor its exit record, monitoring stops and the result is marked **unknown**, never success. Descendant work could still exist: inspect the remote workload and logs before relaunching anything. SSH/network failures continue monitoring; a reused PID can also keep a monitor waiting. Missing recovery files and invalid exit records are reported explicitly. Unknown/failed records remain for diagnosis and do not themselves block an idle daemon from stopping. `retry` retries a failed wake-up with a known exit status, not an unknown task or the task itself.
+`daemon status` counts task monitors and wake-up hooks, not just running experiment processes. This live count is different from the saved task outcomes shown by `status` and `history`; a wake-up hook can remain active after task exit. If a successful remote probe finds neither the recorded process nor its exit record, monitoring stops and the result is marked **unknown**, never success. Descendant work could still exist: inspect the remote workload and logs before relaunching anything. SSH/network failures continue monitoring; a reused PID can also keep a monitor waiting. Missing recovery files and invalid exit records are reported explicitly. Unknown/failed records remain in `history` for diagnosis and do not themselves block an idle daemon from stopping. `retry` retries a failed wake-up with a known exit status, not an unknown task or the task itself.
 
 ```sh
 # After scripts are publicly available:
