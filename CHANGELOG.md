@@ -2,6 +2,7 @@
 
 - Make `slumber status` show running jobs plus outcomes from the rolling previous 24 hours, with no default count cap. Filter completed jobs by exit time regardless of wake-up state; stopped/unknown records without an exit time use their start or submission time.
 - Add `slumber history` for all saved jobs. Both views accept `--limit N` to cap completed/stopped records while keeping running jobs visible; listing never deletes historical data.
+- Wait for the daemon's state lock to be released before reporting a successful stop, preventing immediate restart or update from racing shutdown cleanup.
 - Update clap to 4.6.7, serde_json to 1.0.154 and tokio to 1.54.1. The daemon protocol remains version 5; no state migration is required.
 - Refresh public installation instructions. Use `slumber update` to install the latest stable release after active tasks and wake-up hooks finish.
 
